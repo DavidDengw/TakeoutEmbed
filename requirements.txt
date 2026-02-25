@@ -1,0 +1,3 @@
+# Python package dependencies
+# This project uses only Python standard library modules.
+# External runtime dependency (install separately): exiftool
