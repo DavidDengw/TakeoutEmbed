@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import unicodedata
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+MEDIA_EXTS = {
+    ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tif", ".tiff",
+    ".mp4", ".mov", ".m4v", ".avi", ".3gp"
+}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".3gp"}
+
+DEFAULT_SUFFIX_TOKENS = [
+    "-edited", ".edited", "(1)", "(2)", ".supplemental-metadata", "supplemental-metadata",
+    ".metadata", "-collage", "-effects", "-motion", "-hdr", " copy", " copy 1"
+]
+
+EXCLUDE_DIRS = {"_UPLOAD_READY", "_REVIEW_INVALID", "_logs"}
+
+
+def run(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def check_exiftool():
+    rc, out, _ = run(["exiftool", "-ver"])
+    return rc == 0 and bool(out)
+
+
+def append_jsonl(path: Path, obj: dict):
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def load_success_pairs(apply_log: Path):
+    ok = set()
+    if not apply_log.exists():
+        return ok
+    with apply_log.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("ok") is True and row.get("json_rel") and row.get("media_rel"):
+                ok.add((row["json_rel"], row["media_rel"]))
+    return ok
+
+
+def parse_date_ymd(s: str):
+    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def normalize_stem(name_stem: str, suffix_tokens):
+    s = unicodedata.normalize("NFKC", name_stem).lower().strip()
+    s = re.sub(r"\s+", " ", s)
+
+    changed = True
+    while changed:
+        changed = False
+        s = s.rstrip(" _-.")
+        for t in suffix_tokens:
+            t2 = unicodedata.normalize("NFKC", t).lower().strip()
+            if s.endswith(t2):
+                s = s[: -len(t2)].rstrip(" _-.")
+                changed = True
+
+    strict = re.sub(r"[\s._-]+", "_", s).strip("_")
+    loose = re.sub(r"[^a-z0-9]+", "", strict)
+    return strict or s, loose or re.sub(r"[^a-z0-9]+", "", s)
+
+
+def rel_str(path: Path, root: Path):
+    return str(path.relative_to(root))
+
+
+def iter_files(root: Path):
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.parts):
+            continue
+        yield p
+
+
+def build_indexes(root: Path, suffix_tokens):
+    media_index = defaultdict(set)
+    json_index = defaultdict(set)
+    media_files = []
+    json_files = []
+
+    for p in iter_files(root):
+        ext = p.suffix.lower()
+        if ext in MEDIA_EXTS:
+            media_files.append(p)
+            strict, loose = normalize_stem(p.stem, suffix_tokens)
+            media_index[("strict", strict)].add(p)
+            media_index[("loose", loose)].add(p)
+        elif ext == ".json":
+            json_files.append(p)
+            strict, loose = normalize_stem(p.stem, suffix_tokens)
+            json_index[("strict", strict)].add(p)
+            json_index[("loose", loose)].add(p)
+
+    return media_files, json_files, media_index, json_index
+
+
+def parse_takeout_json(jpath: Path):
+    try:
+        meta = json.loads(jpath.read_text(encoding="utf-8"))
+    except Exception as e:
+        return None, None, None, f"json_parse_error: {e}"
+
+    ts = None
+    pt = (meta.get("photoTakenTime") or {})
+    ct = (meta.get("creationTime") or {})
+
+    if pt.get("timestamp"):
+        try:
+            ts = int(pt.get("timestamp"))
+        except Exception:
+            ts = None
+
+    if ts is None and pt.get("formatted"):
+        try:
+            dt = datetime.fromisoformat(pt.get("formatted").replace("Z", "+00:00"))
+            ts = int(dt.timestamp())
+        except Exception:
+            ts = None
+
+    if ts is None and ct.get("timestamp"):
+        try:
+            ts = int(ct.get("timestamp"))
+        except Exception:
+            ts = None
+
+    gps = None
+    for k in ("geoDataExif", "geoData"):
+        g = meta.get(k) or {}
+        lat = g.get("latitude")
+        lon = g.get("longitude")
+        alt = g.get("altitude")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            if abs(lat) > 1e-7 or abs(lon) > 1e-7:
+                gps = (float(lat), float(lon), float(alt) if isinstance(alt, (int, float)) else None)
+                break
+
+    return meta, ts, gps, None
+
+
+def exif_dt(ts: int):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y:%m:%d %H:%M:%S")
+
+
+def write_metadata(media: Path, ts: int, gps):
+    dt = exif_dt(ts)
+    ext = media.suffix.lower()
+    cmd = ["exiftool", "-overwrite_original", "-P", "-m", "-api", "QuickTimeUTC=1"]
+
+    if ext in VIDEO_EXTS:
+        cmd += [
+            f"-CreateDate={dt}", f"-ModifyDate={dt}", f"-TrackCreateDate={dt}", f"-TrackModifyDate={dt}",
+            f"-MediaCreateDate={dt}", f"-MediaModifyDate={dt}",
+        ]
+    else:
+        cmd += [f"-DateTimeOriginal={dt}", f"-CreateDate={dt}", f"-ModifyDate={dt}"]
+
+    if gps:
+        lat, lon, alt = gps
+        cmd += [f"-GPSLatitude={lat}", f"-GPSLongitude={lon}"]
+        if alt is not None:
+            cmd += [f"-GPSAltitude={alt}"]
+
+    cmd.append(str(media))
+    rc, out, err = run(cmd)
+    return rc == 0, out if out else err
+
+
+def read_effective_date(media: Path):
+    cmd = [
+        "exiftool", "-j",
+        "-DateTimeOriginal", "-CreateDate", "-MediaCreateDate", "-TrackCreateDate",
+        str(media)
+    ]
+    rc, out, err = run(cmd)
+    if rc != 0:
+        return None, f"read_failed: {err or out}"
+    try:
+        rows = json.loads(out)
+        if not rows:
+            return None, "no_exif_row"
+        row = rows[0]
+    except Exception as e:
+        return None, f"read_json_failed: {e}"
+
+    for k in ("DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            dt = parse_exif_date(v)
+            if dt is not None:
+                return dt, None
+    return None, "no_parseable_date"
+
+
+def parse_exif_date(s: str):
+    s = s.strip()
+    s = re.sub(r"([+-]\d\d):(\d\d)$", r"\1\2", s)
+    fmts = [
+        "%Y:%m:%d %H:%M:%S%z",
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(s, f)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def is_valid_date(dt: datetime, min_dt: datetime, max_dt: datetime):
+    return min_dt <= dt <= max_dt
+
+
+def ensure_parent(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def move_file(src: Path, dst: Path):
+    if src.resolve() == dst.resolve():
+        return
+    ensure_parent(dst)
+    if dst.exists():
+        return
+    shutil.move(str(src), str(dst))
+
+
+def matched_media_for_json(jpath: Path, media_index, suffix_tokens):
+    strict, loose = normalize_stem(jpath.stem, suffix_tokens)
+    m = sorted(media_index.get(("strict", strict), []))
+    if m:
+        return m, "strict", strict, loose
+    m = sorted(media_index.get(("loose", loose), []))
+    if m:
+        return m, "loose", strict, loose
+    return [], "none", strict, loose
+
+
+def matched_json_for_media(mpath: Path, json_index, suffix_tokens):
+    strict, loose = normalize_stem(mpath.stem, suffix_tokens)
+    j = sorted(json_index.get(("strict", strict), []))
+    if j:
+        return j
+    return sorted(json_index.get(("loose", loose), []))
+
+
+def pass1_apply(root: Path, json_files, media_index, apply_log: Path, suffix_tokens, success_pairs):
+    for jpath in sorted(json_files):
+        json_rel = rel_str(jpath, root)
+        _, ts, gps, err = parse_takeout_json(jpath)
+        if err:
+            append_jsonl(apply_log, {
+                "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                "media_rel": None, "ok": False, "status": "json_parse_fail", "reason": err
+            })
+            continue
+        if ts is None:
+            append_jsonl(apply_log, {
+                "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                "media_rel": None, "ok": False, "status": "no_timestamp", "reason": "missing photoTakenTime/creationTime"
+            })
+            continue
+
+        matches, mode, strict_key, loose_key = matched_media_for_json(jpath, media_index, suffix_tokens)
+        if not matches:
+            append_jsonl(apply_log, {
+                "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                "media_rel": None, "ok": False, "status": "no_match",
+                "strict_key": strict_key, "loose_key": loose_key
+            })
+            continue
+
+        for media in matches:
+            if "_UPLOAD_READY" in media.parts:
+                continue
+            media_rel = rel_str(media, root)
+            if (json_rel, media_rel) in success_pairs:
+                append_jsonl(apply_log, {
+                    "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                    "media_rel": media_rel, "ok": True, "status": "skip_already_applied", "match_mode": mode
+                })
+                continue
+
+            ok, msg = write_metadata(media, ts, gps)
+            if ok:
+                dt, derr = read_effective_date(media)
+                if dt is None:
+                    append_jsonl(apply_log, {
+                        "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                        "media_rel": media_rel, "ok": False, "status": "verify_fail", "reason": derr,
+                        "match_mode": mode
+                    })
+                else:
+                    append_jsonl(apply_log, {
+                        "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                        "media_rel": media_rel, "ok": True, "status": "applied",
+                        "effective_date_utc": dt.isoformat(), "match_mode": mode
+                    })
+                    success_pairs.add((json_rel, media_rel))
+            else:
+                append_jsonl(apply_log, {
+                    "ts": datetime.now(timezone.utc).isoformat(), "json_rel": json_rel,
+                    "media_rel": media_rel, "ok": False, "status": "write_fail", "reason": msg,
+                    "match_mode": mode
+                })
+
+
+def pass2_validate_move(root: Path, media_files, json_index, move_log: Path, upload_dir: Path,
+                        review_invalid_dir: Path, min_dt: datetime, max_dt: datetime, suffix_tokens):
+    for media in sorted(media_files):
+        if "_UPLOAD_READY" in media.parts:
+            continue
+        media_rel = rel_str(media, root)
+        dt, err = read_effective_date(media)
+        if dt is None or not is_valid_date(dt, min_dt, max_dt):
+            status = "invalid_date"
+            reason = err or (f"out_of_range:{dt.isoformat()}" if dt else "unknown")
+            if review_invalid_dir is not None:
+                dst = review_invalid_dir / media_rel
+                move_file(media, dst)
+                moved_to = str(dst.relative_to(root))
+            else:
+                moved_to = None
+            append_jsonl(move_log, {
+                "ts": datetime.now(timezone.utc).isoformat(), "media_rel": media_rel,
+                "ok": False, "status": status, "reason": reason, "moved_to": moved_to
+            })
+            continue
+
+        media_dst = upload_dir / media_rel
+        move_file(media, media_dst)
+
+        moved_json = []
+        for j in matched_json_for_media(media, json_index, suffix_tokens):
+            if not j.exists():
+                continue
+            if "_UPLOAD_READY" in j.parts:
+                continue
+            jrel = rel_str(j, root)
+            jdst = upload_dir / jrel
+            move_file(j, jdst)
+            moved_json.append(jrel)
+
+        append_jsonl(move_log, {
+            "ts": datetime.now(timezone.utc).isoformat(), "media_rel": media_rel,
+            "ok": True, "status": "moved_valid", "effective_date_utc": dt.isoformat(),
+            "moved_to": str(media_dst.relative_to(root)), "json_moved": moved_json
+        })
+
+
+def parse_suffix_tokens(raw: str):
+    if not raw:
+        return DEFAULT_SUFFIX_TOKENS
+    try:
+        val = json.loads(raw)
+        if isinstance(val, list):
+            return [str(x) for x in val]
+    except Exception:
+        pass
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Google Takeout per-folder fixer: JSON-first apply, then validate+move.")
+    ap.add_argument("folder", help="Path to one 'Photos from YEAR' folder")
+    ap.add_argument("--min-date", default="2000-01-01", help="Valid min date (YYYY-MM-DD)")
+    ap.add_argument("--max-date", default="2025-12-31", help="Valid max date (YYYY-MM-DD)")
+    ap.add_argument("--suffix-tokens", default="", help="JSON array or comma-list of suffix tokens")
+    ap.add_argument("--review-invalid", action="store_true", help="Move invalid media to _REVIEW_INVALID")
+    args = ap.parse_args()
+
+    root = Path(args.folder).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise SystemExit(f"Folder not found: {root}")
+    if not check_exiftool():
+        raise SystemExit("exiftool not found. Install: brew install exiftool")
+
+    min_dt = parse_date_ymd(args.min_date)
+    max_dt = parse_date_ymd(args.max_date).replace(hour=23, minute=59, second=59)
+    suffix_tokens = parse_suffix_tokens(args.suffix_tokens)
+
+    upload_dir = root / "_UPLOAD_READY"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    review_invalid_dir = root / "_REVIEW_INVALID" if args.review_invalid else None
+    if review_invalid_dir is not None:
+        review_invalid_dir.mkdir(parents=True, exist_ok=True)
+
+    apply_log = root / "apply_log.jsonl"
+    move_log = root / "move_log.jsonl"
+
+    media_files, json_files, media_index, json_index = build_indexes(root, suffix_tokens)
+    success_pairs = load_success_pairs(apply_log)
+
+    pass1_apply(root, json_files, media_index, apply_log, suffix_tokens, success_pairs)
+
+    media_files2, _, _, json_index2 = build_indexes(root, suffix_tokens)
+    pass2_validate_move(root, media_files2, json_index2, move_log, upload_dir, review_invalid_dir, min_dt, max_dt, suffix_tokens)
+
+    print(json.dumps({
+        "folder": str(root),
+        "apply_log": str(apply_log),
+        "move_log": str(move_log),
+        "upload_ready": str(upload_dir),
+        "review_invalid": str(review_invalid_dir) if review_invalid_dir else None
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
