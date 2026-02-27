@@ -4,6 +4,7 @@ import json
 import os
 import re
 import unicodedata
+import threading
 import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -398,7 +399,29 @@ def read_effective_timestamp(media: Path) -> Tuple[Optional[datetime], str]:
     return None, "missing_tags"
 
 
+
+def _exact_media_candidate_from_json(jpath: Path) -> Optional[Path]:
+    # Example: IMG_1684.PNG.supplemental-metadata.json -> IMG_1684.PNG
+    base = jpath.name[:-5] if jpath.name.lower().endswith('.json') else jpath.name
+    ext_alt = '|'.join(re.escape(e.lstrip('.')) for e in sorted(MEDIA_EXTS, key=len, reverse=True))
+    m = re.match(rf'^(.*\.(?:{ext_alt}))(?:[._-].*)?$', base, re.IGNORECASE)
+    if not m:
+        return None
+    candidate = jpath.with_name(m.group(1))
+    if candidate.exists() and candidate.is_file():
+        return candidate
+    # case-insensitive fallback in same folder
+    target_lower = m.group(1).lower()
+    for f in jpath.parent.iterdir():
+        if f.is_file() and f.name.lower() == target_lower:
+            return f
+    return None
+
 def choose_matches_for_json(jpath: Path, media_index, suffix_tokens: List[str]) -> Tuple[List[Path], str]:
+    exact = _exact_media_candidate_from_json(jpath)
+    if exact is not None:
+        return [exact], "exact_filename"
+
     strict, loose = normalize_stem(jpath.stem, suffix_tokens)
     candidates = sorted(media_index.get(("strict", strict), []))
     mode = "strict"
@@ -422,7 +445,8 @@ def choose_matches_for_json(jpath: Path, media_index, suffix_tokens: List[str]) 
     if best <= 0:
         return [], "none"
     picked = sorted([c for sc, c in scored if sc == best])
-    return picked, mode
+    # pick a single deterministic winner to avoid many-to-one concurrent writes
+    return [picked[0]], mode
 
 
 def choose_jsons_for_media(mpath: Path, json_index, suffix_tokens: List[str]) -> List[Path]:
@@ -467,6 +491,8 @@ def atomic_move_no_overwrite(src: Path, dst: Path) -> Path:
 def pass1_apply(cfg: Config, run_id: str, json_files: List[Path], media_index, apply_log: Path,
                 applied_ok_pairs: Set[Tuple[str, str]]) -> Counter:
     stats = Counter()
+    media_locks: Dict[str, threading.Lock] = {}
+    media_locks_guard = threading.Lock()
 
     def task(jpath: Path):
         local_rows = []
@@ -509,7 +535,11 @@ def pass1_apply(cfg: Config, run_id: str, json_files: List[Path], media_index, a
                 })
                 continue
 
-            ok, msg, media_after = write_metadata(media, ts, gps)
+            media_key = str(media.resolve())
+            with media_locks_guard:
+                lock = media_locks.setdefault(media_key, threading.Lock())
+            with lock:
+                ok, msg, media_after = write_metadata(media, ts, gps)
             if not ok:
                 local_stats["pairs_applied_fail"] += 1
                 local_rows.append({
