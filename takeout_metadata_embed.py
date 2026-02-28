@@ -45,8 +45,17 @@ class Config:
 
 
 def run(cmd: List[str]) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p.returncode, p.stdout.strip(), p.stderr.strip()
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except Exception as e:
+        return 1, "", str(e)
 
 
 def check_exiftool() -> None:
