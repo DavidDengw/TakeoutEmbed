@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+._*
+
+# runtime artifacts
+*.log
+*.jsonl
+
+# local staging/output folders
+_UPLOAD_READY/
+_REVIEW_INVALID/
+*_crossfolder_pairs/

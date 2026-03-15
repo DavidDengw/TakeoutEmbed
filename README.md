@@ -1,75 +1,53 @@
 # TakeoutEmbed
 
-Process Google Takeout media folders and embed JSON sidecar metadata into media files, then move valid results into `_UPLOAD_READY`.
+Toolkit for recovering fragmented Google Takeout exports and preparing clean uploads to Apple Photos/iCloud.
 
-## What it does
+## What this project solves
 
-For each `Photos from YYYY` folder (or a single year folder):
+- Media and JSON sidecars split across many takeout archives
+- Metadata embed failures (`no_match`, missing sidecars, junk sidecars)
+- Staging chaos (`_UPLOAD_READY` at multiple levels)
+- macOS import issues (AppleEvent timeout, disk pressure)
+- Codec incompatibility (VP9 videos fail in QuickTime/Photos)
 
-1. **Pass 1 (apply)**
-   - Reads sidecar `.json` files
-   - Fuzzy-matches JSON to media filenames
-   - Writes timestamp + location metadata into media using `exiftool`
+## Main workflow
 
-2. **Pass 2 (validate + move)**
-   - Reads effective media timestamp from metadata
-   - If date is valid (default: `2000-01-01` to `2025-12-31`), moves media to `_UPLOAD_READY`
-   - Moves matching JSON files alongside moved media
+1. Run metadata embed (`scripts/embed/takeout_metadata_embed.py`)
+2. (Optional) run cross-folder recovery and rerun embed
+3. Clean staging structure (single canonical `_UPLOAD_READY` per year)
+4. Import to Photos with disk-space gate (`scripts/import/upload_icloud_photos_range.sh`)
+5. Convert VP9 to H.264 when needed (`scripts/convert/...`)
 
-3. **Resumable logs**
-   - `apply_log.log`
-   - `move_log.log`
+See `docs/WORKFLOW.md`.
 
 ## Requirements
 
 - Python 3.9+
-- `exiftool` installed and available in PATH
+- `exiftool`
+- `ffmpeg` (for video conversion)
+- macOS Photos automation uses `osascript`
 
-macOS install:
-
-```bash
-brew install exiftool
-```
-
-## Usage
-
-### Process one year folder
+## Quick start
 
 ```bash
-python3 takeout_metadata_embed.py "/path/to/Google Photos/Photos from 2014"
+# 1) Embed local sidecars
+python3 scripts/embed/takeout_metadata_embed.py "/path/to/root" --workers 4
+
+# 2) Optional cross-folder recovery + rerun
+python3 scripts/embed/takeout_metadata_embed.py "/path/to/root" --crossfolder --crossfolder-root "/path/to/root"
+
+# 3) macOS batch import
+bash scripts/import/upload_icloud_photos_range.sh
 ```
 
-### Process a parent folder containing many `Photos from YYYY` folders
+## Scripts
 
-```bash
-python3 takeout_metadata_embed.py "/path/to/Google Photos"
-```
+- `scripts/embed/takeout_metadata_embed.py` — core embed/validate/move pipeline
+- `scripts/import/upload_icloud_photos_range.sh` — range import into Photos with free-space gate
+- `scripts/convert/convert_vp9_to_h264_crossplatform.py` — safe VP9->H.264 conversion
+- `scripts/utilities/find_and_copy_from_csv.py` — CSV file finder/copy helper
+- `scripts/windows/*.ps1` — Windows helpers
 
-### Useful flags
+## Project status
 
-```bash
-python3 takeout_metadata_embed.py "/path/to/Google Photos" \
-  --workers 4 \
-  --valid-start 2000-01-01 \
-  --valid-end 2025-12-31 \
-  --preserve-subpaths
-```
-
-Optional:
-- `--flatten` (instead of preserving subpaths in `_UPLOAD_READY`)
-- `--review-invalid` (move invalid files to `_REVIEW_INVALID`)
-- `--suffix-tokens '["-edited", "copy", "duplicate"]'`
-
-## Output
-
-Inside each processed `Photos from YYYY` folder:
-
-- `_UPLOAD_READY/`
-- `apply_log.log`
-- `move_log.log`
-- optionally `_REVIEW_INVALID/`
-
-## Notes
-
-- Script uses only Python standard library + external `exiftool`.
-- No cloud/API/LLM dependency at runtime.
+Pipeline was used to process large multi-part Takeout sets, recover many cross-folder matches, and isolate true hard-failure remainders for focused diagnostics.

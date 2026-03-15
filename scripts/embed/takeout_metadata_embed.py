@@ -5,6 +5,7 @@ import os
 import re
 import unicodedata
 import threading
+import shutil
 import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -454,8 +455,9 @@ def choose_matches_for_json(jpath: Path, media_index, suffix_tokens: List[str]) 
     if best <= 0:
         return [], "none"
     picked = sorted([c for sc, c in scored if sc == best])
-    # pick a single deterministic winner to avoid many-to-one concurrent writes
-    return [picked[0]], mode
+    # Return all top-scoring variants (e.g., base + -edited) while pass1 per-media locks
+    # prevent concurrent write collisions on the same file.
+    return picked, mode
 
 
 def choose_jsons_for_media(mpath: Path, json_index, suffix_tokens: List[str]) -> List[Path]:
@@ -648,10 +650,8 @@ def pass2_validate_move(cfg: Config, run_id: str, media_files: List[Path], json_
             print_pass_progress("pass2", done_media, total_media)
             continue
 
-        if cfg.preserve_subpaths:
-            dst_media = upload_root / media_rel
-        else:
-            dst_media = upload_root / media.name
+        # Keep moved outputs at year-layer _UPLOAD_READY (flat by filename)
+        dst_media = upload_root / media.name
         new_media = atomic_move_no_overwrite(media, dst_media)
 
         moved_json = []
@@ -659,10 +659,8 @@ def pass2_validate_move(cfg: Config, run_id: str, media_files: List[Path], json_
             if not j.exists():
                 continue
             j_rel = rel(j, cfg.root)
-            if cfg.preserve_subpaths:
-                dst_j = upload_root / j_rel
-            else:
-                dst_j = upload_root / j.name
+            # Keep JSON alongside flattened media destination
+            dst_j = upload_root / j.name
             new_j = atomic_move_no_overwrite(j, dst_j)
             moved_json.append(rel(new_j, cfg.root))
 
@@ -705,10 +703,8 @@ def move_json_for_already_uploaded(cfg: Config, run_id: str, move_log: Path) -> 
             if not j.exists():
                 continue
             j_rel = rel(j, cfg.root)
-            if cfg.preserve_subpaths:
-                dst_j = upload_root / j_rel
-            else:
-                dst_j = upload_root / j.name
+            # Keep JSON alongside flattened media destination
+            dst_j = upload_root / j.name
             new_j = atomic_move_no_overwrite(j, dst_j)
             append_jsonl(move_log, {
                 "run_id": run_id,
@@ -793,6 +789,56 @@ def collect_failure_reasons(apply_log: Path, move_log: Path, run_id: str):
     return apply_reasons, move_reasons
 
 
+def stage_crossfolder_json(year_folder: Path, search_root: Path, suffix_tokens: List[str]) -> tuple[int, int]:
+    """Copy matching JSON from other folders of the same year into unresolved media folders."""
+    year_name = year_folder.name
+    local_json_keys = set()
+    media_files = []
+
+    for p in year_folder.rglob("*"):
+        if not p.is_file() or "_UPLOAD_READY" in p.parts:
+            continue
+        if p.suffix.lower() == ".json":
+            k, _ = normalize_stem(p.stem, suffix_tokens)
+            local_json_keys.add(k)
+        elif p.suffix.lower() in MEDIA_EXTS:
+            media_files.append(p)
+
+    json_by_key: Dict[str, List[Path]] = {}
+    for yf in search_root.rglob(year_name):
+        if not yf.is_dir() or "_UPLOAD_READY" in yf.parts:
+            continue
+        try:
+            if yf.resolve() == year_folder.resolve():
+                continue
+        except Exception:
+            pass
+        for j in yf.rglob("*.json"):
+            if not j.is_file() or "_UPLOAD_READY" in j.parts:
+                continue
+            k, _ = normalize_stem(j.stem, suffix_tokens)
+            json_by_key.setdefault(k, []).append(j)
+
+    staged = 0
+    unresolved = 0
+    for m in media_files:
+        mk, _ = normalize_stem(m.stem, suffix_tokens)
+        if mk in local_json_keys:
+            continue
+        cands = json_by_key.get(mk, [])
+        if not cands:
+            unresolved += 1
+            continue
+        src = cands[0]
+        dst = m.parent / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            staged += 1
+        local_json_keys.add(mk)
+
+    return staged, unresolved
+
+
 def process_one_root(root: Path, args) -> dict:
     cfg = Config(
         root=root,
@@ -872,6 +918,8 @@ def main():
     ap.add_argument("--flatten", action="store_true", help="Move into _UPLOAD_READY flattened instead of preserving subpaths")
     ap.add_argument("--review-invalid", action="store_true", help="Move invalid files to _REVIEW_INVALID")
     ap.add_argument("--suffix-tokens", default="", help="JSON array or comma list")
+    ap.add_argument("--crossfolder", action="store_true", help="Stage matching JSON from other folders of same year and rerun")
+    ap.add_argument("--crossfolder-root", default="", help="Root path to search cross-folder JSON (default: input folder root)")
     args = ap.parse_args()
 
     root = Path(args.folder).expanduser().resolve()
@@ -882,7 +930,7 @@ def main():
 
     # If given a parent, process each "Photos from YEAR" folder one by one.
     # Recursive search so parent can be above the Google Photos folder too.
-    children = [d for d in root.rglob("*") if d.is_dir() and re.match(r"(?i)^photos from \d{4}$", d.name)]
+    children = [d for d in root.rglob("*") if d.is_dir() and re.match(r"(?i)^photos from \d{4}$", d.name) and "_UPLOAD_READY" not in d.parts]
     if children:
         targets = sorted(set(children))
     else:
@@ -895,9 +943,20 @@ def main():
         print(f" - {t}")
     print(render_progress(0, total))
 
+    cf_root = Path(args.crossfolder_root).expanduser().resolve() if args.crossfolder_root else root
+    suffix_tokens = parse_suffix_tokens(args.suffix_tokens)
+
     for i, t in enumerate(targets, start=1):
         print(f"\n=== [{i}/{total}] {t.name} ===")
         results.append(process_one_root(t, args))
+
+        if args.crossfolder:
+            staged, unresolved = stage_crossfolder_json(t, cf_root, suffix_tokens)
+            print(f"crossfolder: staged_json={staged} unresolved_media={unresolved}")
+            if staged > 0:
+                print("crossfolder: rerun after staging")
+                results.append(process_one_root(t, args))
+
         print(render_progress(i, total))
 
     print("\nDone all folders.")
