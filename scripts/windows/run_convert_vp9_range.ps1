@@ -1,9 +1,12 @@
-$BaseDir = "D:\Work\TakeoutFiles"
-$ScriptPath = "D:\Work\convert_vp9_to_h264.py"
-if (-not (Test-Path -LiteralPath $ScriptPath)) { $ScriptPath = "D:\Work\convert_vp9_to_h264" }
-$Prefix = "takeout-20260221T191720Z-3-"
-$Start = 28
-$End = 36
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$BaseDir,
+    [Parameter(Mandatory=$true)]
+    [string]$ScriptPath,
+    [string]$Prefix = "takeout-YYYYMMDDThhmmssZ-part-",
+    [int]$Start = 1,
+    [int]$End = 1
+)
 
 if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "Python script not found: $ScriptPath" }
 if (-not (Test-Path -LiteralPath $BaseDir)) { throw "Base folder not found: $BaseDir" }

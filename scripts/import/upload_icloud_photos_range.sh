@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="/Volumes/Work/TakeoutFiles"
-PREFIX="takeout-20260221T191720Z-3-"
-START=32
-END=36
+BASE_DIR="${BASE_DIR:-}"
+PREFIX="${PREFIX:-takeout-YYYYMMDDThhmmssZ-part-}"
+START="${START:-1}"
+END="${END:-1}"
+
+if [[ -z "$BASE_DIR" ]]; then
+  echo "Set BASE_DIR env var (example: BASE_DIR=/path/to/TakeoutFiles)"
+  exit 1
+fi
 
 # If you want to test without importing, run:
 #   DRY_RUN=1 ./upload_icloud_photos_range.sh

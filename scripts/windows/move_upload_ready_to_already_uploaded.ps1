@@ -1,6 +1,8 @@
 param(
-    [string]$SourceRoot = "D:\Work\TakeoutFiles",
-    [string]$DestRoot = "D:\Work\already uploaded",
+    [Parameter(Mandatory=$true)]
+    [string]$SourceRoot,
+    [Parameter(Mandatory=$true)]
+    [string]$DestRoot,
     [switch]$DryRun
 )
 
